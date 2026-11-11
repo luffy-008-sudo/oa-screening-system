@@ -881,6 +881,7 @@ class ESP32FirebaseBridge:
         self._total_lines   = 0
         self._valid_samples = 0
         self._rejected      = 0
+        self._latest_sample: Optional[Dict[str, Any]] = None
 
         # Set during run()
         self._session_id: Optional[str] = None
@@ -1014,6 +1015,7 @@ class ESP32FirebaseBridge:
 
             self._valid_samples += 1
             sample["seq"] = self._valid_samples
+            self._latest_sample = dict(sample, server_ts=int(time.time() * 1000))
             all_samples.append(sample)
 
             # Write CSV backup immediately
@@ -1070,6 +1072,7 @@ class ESP32FirebaseBridge:
             }
 
             self._valid_samples += 1
+            self._latest_sample = dict(sample, server_ts=int(time.time() * 1000))
             all_samples.append(sample)
             self._csv_writer.write(sample, self._valid_samples, "simulated")
 
@@ -1256,18 +1259,64 @@ def start_fastapi_server(host: str = "127.0.0.1", port: int = 8765) -> None:
     def get_latest(patient_id: str, session_id: str):
         """
         Read the most recent sensor reading from Firebase Realtime Database.
-        Returns the raw dict or {error: ...} if unavailable.
+        Falls back to the active bridge's in-memory sample in demo mode or
+        before the first 200ms RTDB write completes.
         """
+        global _active_bridge
+        if _rtdb is not None and not (_active_bridge and _active_bridge.demo_mode):
+            try:
+                ref = _rtdb.reference(f"live_sessions/{patient_id}/{session_id}/latest")
+                data = ref.get()
+                if data is not None:
+                    return data
+            except Exception as exc:
+                logger.debug("RTDB get_latest error: %s", exc)
+
+        if (
+            _active_bridge is not None
+            and _active_bridge._session_id == session_id
+            and _active_bridge._latest_sample is not None
+        ):
+            return _active_bridge._latest_sample
+
         if _rtdb is None:
             return {"error": "rtdb_unavailable"}
+        return {"error": "no_data_yet"}
+
+    @app.get("/rtdb_chunks/{patient_id}/{session_id}")
+    def get_rtdb_chunks(patient_id: str, session_id: str):
+        """
+        Retrieve all recorded 50 Hz sample chunks & server timestamps
+        directly from Firebase Realtime Database for a given session.
+        Path: live_sessions/{patientId}/{sessionId}/chunks
+        """
+        if _rtdb is None:
+            return {"samples": [], "error": "rtdb_unavailable"}
         try:
-            ref = _rtdb.reference(f"live_sessions/{patient_id}/{session_id}/latest")
-            data = ref.get()
-            if data is None:
-                return {"error": "no_data_yet"}
-            return data
+            ref = _rtdb.reference(f"live_sessions/{patient_id}/{session_id}/chunks")
+            chunks_raw = ref.get()
+            if not chunks_raw:
+                return {"samples": [], "chunk_count": 0}
+
+            flat_samples = []
+            for chunk_key in sorted(chunks_raw.keys()):
+                chunk = chunks_raw[chunk_key]
+                srv_ts = chunk.get("server_received")
+                samples_dict = chunk.get("samples", {})
+                for s_key in sorted(samples_dict.keys()):
+                    row = dict(samples_dict[s_key])
+                    row["chunk_id"] = chunk_key
+                    row["server_received"] = srv_ts
+                    flat_samples.append(row)
+
+            return {
+                "samples": flat_samples,
+                "chunk_count": len(chunks_raw),
+                "sample_count": len(flat_samples),
+                "source": "firebase_rtdb",
+            }
         except Exception as exc:
-            return {"error": str(exc)}
+            return {"samples": [], "error": str(exc)}
 
     @app.get("/sessions/{patient_id}")
     def get_sessions(patient_id: str):

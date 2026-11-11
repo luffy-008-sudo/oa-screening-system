@@ -1073,6 +1073,7 @@ def page_gait_monitoring(patient_id: str):
         stop_recording,
         get_session_history,
         read_latest_from_rtdb,
+        retrieve_chunks_from_rtdb,
     )
 
     tab_live, tab_history = st.tabs(["⚡ Live Recording", "📈 Session History"])
@@ -1318,10 +1319,16 @@ def page_gait_monitoring(patient_id: str):
                     except Exception as ex:
                         st.caption(f"Chart loading… ({ex})")
 
+                # Format Firebase server timestamp if present
+                srv_ts_raw = latest.get("server_ts")
+                srv_time_str = "Live"
+                if isinstance(srv_ts_raw, (int, float)) and srv_ts_raw > 1e12:
+                    srv_time_str = datetime.fromtimestamp(srv_ts_raw / 1000.0).strftime("%H:%M:%S.%f")[:-4]
+
                 # Auto-refresh every 2 seconds while recording
                 st.caption(
-                    f"&#9203; Auto-refreshing every 2s | Last sample: {ts_ms} ms | "
-                    f"Total valid: {valid_samples:,}"
+                    f"&#9203; Auto-refreshing every 2s | Server Time: {srv_time_str} | "
+                    f"ESP32 Timestamp: {ts_ms} ms | Total valid: {valid_samples:,}"
                 )
                 time.sleep(2)
                 st.rerun()
@@ -1439,111 +1446,145 @@ def page_gait_monitoring(patient_id: str):
                         )
 
         with col_hist_right:
-            if not patient_files:
-                st.info("Select a recorded session to inspect its data.")
+            data_source_choice = st.radio(
+                "Data Source",
+                ["Local CSV Backups", "Firebase Cloud (Firestore + RTDB)"],
+                horizontal=True,
+                index=1 if (fs_sessions and not patient_files) else 0,
+            )
+
+            df = None
+            selected_name = ""
+            cloud_feats = None
+
+            if data_source_choice == "Local CSV Backups":
+                if not patient_files:
+                    st.info("No local CSV backups found for this patient yet.")
+                else:
+                    sel_file = st.selectbox(
+                        "Open Local Session CSV",
+                        patient_files,
+                        format_func=lambda x: x.name,
+                    )
+                    if sel_file:
+                        df = pd.read_csv(sel_file)
+                        selected_name = sel_file.name
             else:
-                sel_file = st.selectbox(
-                    "Open Session CSV",
-                    patient_files,
-                    format_func=lambda x: x.name,
-                )
+                if not bridge_online:
+                    st.warning("Start the bridge server to query Firebase Cloud records.")
+                elif not fs_sessions:
+                    st.info(f"No sessions saved in Firestore for {patient_id} yet.")
+                else:
+                    sel_sess = st.selectbox(
+                        "Select Firebase Cloud Session",
+                        fs_sessions,
+                        format_func=lambda s: f"{s.get('session_id', 'unknown')} ({s.get('valid_samples', 0)} samples)",
+                    )
+                    if sel_sess:
+                        sid_cloud = sel_sess.get("session_id", "")
+                        selected_name = f"{sid_cloud}_firebase.csv"
+                        cloud_feats = sel_sess.get("features")
+                        with st.spinner("Retrieving time-series chunks from Firebase RTDB..."):
+                            rtdb_samples = retrieve_chunks_from_rtdb(patient_id, sid_cloud)
+                        if rtdb_samples:
+                            df = pd.DataFrame(rtdb_samples)
+                            df["data_source"] = sel_sess.get("data_source", "real")
+                            st.success(f"Retrieved {len(df):,} samples + timestamps directly from Firebase Realtime Database.")
+                        else:
+                            st.warning("Session metadata exists in Firestore, but no RTDB raw chunks were found for this session.")
 
-                if sel_file:
-                    df = pd.read_csv(sel_file)
-                    n_rows = len(df)
+            if df is not None and not df.empty:
+                n_rows = len(df)
 
-                    # --- Session info row ---
-                    mi1, mi2, mi3, mi4 = st.columns(4)
-                    mi1.metric("Total Samples", f"{n_rows:,}")
-                    if "timestamp_ms" in df.columns and n_rows > 1:
-                        dur_s = (df["timestamp_ms"].iloc[-1] - df["timestamp_ms"].iloc[0]) / 1000.0
-                        actual_hz = n_rows / dur_s if dur_s > 0 else 0
-                        mi2.metric("Duration", f"{dur_s:.1f}s")
-                        mi3.metric("Actual Sample Rate", f"{actual_hz:.1f} Hz")
-                    src = df["data_source"].iloc[0] if "data_source" in df.columns else "real"
-                    mi4.metric("Data Source", src.upper())
+                # --- Session info row ---
+                mi1, mi2, mi3, mi4 = st.columns(4)
+                mi1.metric("Total Samples", f"{n_rows:,}")
+                if "timestamp_ms" in df.columns and n_rows > 1:
+                    dur_s = (df["timestamp_ms"].iloc[-1] - df["timestamp_ms"].iloc[0]) / 1000.0
+                    actual_hz = n_rows / dur_s if dur_s > 0 else 0
+                    mi2.metric("Duration", f"{dur_s:.1f}s")
+                    mi3.metric("Actual Sample Rate", f"{actual_hz:.1f} Hz")
+                src = df["data_source"].iloc[0] if "data_source" in df.columns else "real"
+                mi4.metric("Data Source", src.upper())
 
-                    if src == "simulated":
-                        st.warning("DEMO DATA — these are simulated sensor readings, not from real hardware.")
+                if src == "simulated":
+                    st.warning("DEMO DATA — these are simulated sensor readings, not from real hardware.")
 
-                    # --- Pressure chart ---
-                    if all(c in df.columns for c in ("heel", "midfoot", "forefoot")):
-                        st.markdown("**FSR Pressure Loading Profile (ADC 0–4095)**")
-                        time_s = (df["timestamp_ms"] - df["timestamp_ms"].iloc[0]) / 1000.0 if "timestamp_ms" in df.columns else np.arange(n_rows)
+                # --- Timestamp preview ---
+                ts_cols = [c for c in ("seq", "host_timestamp_utc", "server_received", "timestamp_ms", "heel", "midfoot", "forefoot") if c in df.columns]
+                if ts_cols:
+                    with st.expander("🕒 View Sample Timestamps & Raw Telemetry"):
+                        st.dataframe(df[ts_cols].head(50), use_container_width=True, hide_index=True)
 
-                        if _MATPLOTLIB_AVAILABLE:
-                            fig, ax = create_dark_figure(figsize=(9, 3.2))
-                            ax.plot(time_s, df["heel"],     color="#FF6B00", label="Heel",     linewidth=1.5)
-                            ax.plot(time_s, df["midfoot"],  color="#FF8A24", label="Midfoot",  linewidth=1.4, linestyle="--")
-                            ax.plot(time_s, df["forefoot"], color="#ffffff", label="Forefoot", linewidth=1.4)
-                            ax.set_xlabel("Time (s)",      color="#9E9E9E", fontsize=9)
-                            ax.set_ylabel("ADC (0–4095)",  color="#9E9E9E", fontsize=9)
-                            ax.set_ylim(0, 4095)
-                            ax.legend(facecolor="#1a1a1a", edgecolor="#333", labelcolor="#fff", fontsize=8)
-                            plt.tight_layout()
-                            st.pyplot(fig)
-                            plt.close(fig)
+                # --- Pressure chart ---
+                time_s = (df["timestamp_ms"] - df["timestamp_ms"].iloc[0]) / 1000.0 if "timestamp_ms" in df.columns else np.arange(n_rows)
+                if all(c in df.columns for c in ("heel", "midfoot", "forefoot")):
+                    st.markdown("**FSR Pressure Loading Profile (ADC 0–4095)**")
+                    if _MATPLOTLIB_AVAILABLE:
+                        fig, ax = create_dark_figure(figsize=(9, 3.2))
+                        ax.plot(time_s, df["heel"],     color="#FF6B00", label="Heel",     linewidth=1.5)
+                        ax.plot(time_s, df["midfoot"],  color="#FF8A24", label="Midfoot",  linewidth=1.4, linestyle="--")
+                        ax.plot(time_s, df["forefoot"], color="#ffffff", label="Forefoot", linewidth=1.4)
+                        ax.set_xlabel("Time (s)",      color="#9E9E9E", fontsize=9)
+                        ax.set_ylabel("ADC (0–4095)",  color="#9E9E9E", fontsize=9)
+                        ax.set_ylim(0, 4095)
+                        ax.legend(facecolor="#1a1a1a", edgecolor="#333", labelcolor="#fff", fontsize=8)
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close(fig)
 
-                    # --- IMU chart ---
-                    if all(c in df.columns for c in ("acc_x_g", "acc_y_g", "acc_z_g")):
-                        st.markdown("**Accelerometer (g-force)**")
-                        if _MATPLOTLIB_AVAILABLE:
-                            fig2, ax2 = create_dark_figure(figsize=(9, 2.5))
-                            ax2.plot(time_s, df["acc_x_g"], color="#FF6B00", label="X", linewidth=1.2)
-                            ax2.plot(time_s, df["acc_y_g"], color="#FF8A24", label="Y", linewidth=1.2)
-                            ax2.plot(time_s, df["acc_z_g"], color="#ffffff", label="Z", linewidth=1.2)
-                            ax2.set_xlabel("Time (s)", color="#9E9E9E", fontsize=9)
-                            ax2.set_ylabel("g-force",  color="#9E9E9E", fontsize=9)
-                            ax2.legend(facecolor="#1a1a1a", edgecolor="#333", labelcolor="#fff", fontsize=8)
-                            plt.tight_layout()
-                            st.pyplot(fig2)
-                            plt.close(fig2)
+                # --- IMU chart ---
+                if all(c in df.columns for c in ("acc_x_g", "acc_y_g", "acc_z_g")):
+                    st.markdown("**Accelerometer (g-force)**")
+                    if _MATPLOTLIB_AVAILABLE:
+                        fig2, ax2 = create_dark_figure(figsize=(9, 2.5))
+                        ax2.plot(time_s, df["acc_x_g"], color="#FF6B00", label="X", linewidth=1.2)
+                        ax2.plot(time_s, df["acc_y_g"], color="#FF8A24", label="Y", linewidth=1.2)
+                        ax2.plot(time_s, df["acc_z_g"], color="#ffffff", label="Z", linewidth=1.2)
+                        ax2.set_xlabel("Time (s)", color="#9E9E9E", fontsize=9)
+                        ax2.set_ylabel("g-force",  color="#9E9E9E", fontsize=9)
+                        ax2.legend(facecolor="#1a1a1a", edgecolor="#333", labelcolor="#fff", fontsize=8)
+                        plt.tight_layout()
+                        st.pyplot(fig2)
+                        plt.close(fig2)
 
-                    # --- Extracted features ---
-                    st.markdown("**Extracted Gait Features**")
-                    feat_p = config.DATA_PROCESSED_DIR / (sel_file.stem + "_clean_features.json")
+                # --- Extracted features ---
+                st.markdown("**Extracted Gait Features**")
+                feats = cloud_feats
+                if not feats:
+                    stem = Path(selected_name).stem
+                    feat_p = config.DATA_PROCESSED_DIR / (stem + "_clean_features.json")
                     if feat_p.exists():
                         with open(feat_p, "r", encoding="utf-8") as f_feat:
                             feats = json.load(f_feat)
-                        # Show only numeric features in a clean table
-                        feat_rows = [
-                            {"Feature": k, "Value": round(v, 4) if isinstance(v, float) else v}
-                            for k, v in feats.items()
-                            if isinstance(v, (int, float)) and k != "disclaimer"
-                        ]
-                        if feat_rows:
-                            st.dataframe(
-                                pd.DataFrame(feat_rows),
-                                use_container_width=True,
-                                hide_index=True,
-                            )
-                    else:
-                        # Extract on-the-fly if features file missing
-                        try:
-                            ext = FeatureExtractor()
-                            feats = ext.extract_features(df)
-                            feat_rows = [
-                                {"Feature": k, "Value": round(v, 4) if isinstance(v, float) else v}
-                                for k, v in feats.items()
-                                if isinstance(v, (int, float)) and k != "disclaimer"
-                            ]
-                            if feat_rows:
-                                st.dataframe(
-                                    pd.DataFrame(feat_rows),
-                                    use_container_width=True,
-                                    hide_index=True,
-                                )
-                        except Exception as ex:
-                            st.caption(f"Feature extraction skipped: {ex}")
+                if not feats:
+                    try:
+                        ext = FeatureExtractor()
+                        feats = ext.extract_features(df)
+                    except Exception as ex:
+                        st.caption(f"Feature extraction skipped: {ex}")
 
-                    # --- CSV download ---
-                    st.download_button(
-                        "📥 Download Session CSV",
-                        data=df.to_csv(index=False).encode("utf-8"),
-                        file_name=sel_file.name,
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
+                if feats:
+                    feat_rows = [
+                        {"Feature": k, "Value": round(v, 4) if isinstance(v, float) else v}
+                        for k, v in feats.items()
+                        if isinstance(v, (int, float)) and k != "disclaimer"
+                    ]
+                    if feat_rows:
+                        st.dataframe(
+                            pd.DataFrame(feat_rows),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                # --- CSV download ---
+                st.download_button(
+                    "📥 Download Session CSV",
+                    data=df.to_csv(index=False).encode("utf-8"),
+                    file_name=selected_name or "session.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
 
 # ===========================================================================

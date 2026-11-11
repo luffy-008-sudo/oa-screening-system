@@ -175,3 +175,14 @@ def get_session_history(patient_id: str) -> List[Dict[str, Any]]:
     if result and "sessions" in result:
         return result["sessions"]
     return []
+
+
+def retrieve_chunks_from_rtdb(patient_id: str, session_id: str) -> List[Dict[str, Any]]:
+    """
+    Retrieve all saved sample chunks (including ESP32 timestamp_ms and
+    Firebase server_received timestamps) directly from Realtime Database.
+    """
+    result = _http_get(f"/rtdb_chunks/{patient_id}/{session_id}", timeout=8.0)
+    if result and "samples" in result:
+        return result["samples"]
+    return []
