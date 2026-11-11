@@ -1,7 +1,8 @@
 # OA Screening System — Python Dependencies
 # ===========================================
-# Install with:   pip install -r requirements.txt
-# (Activate your virtual environment first)
+# Install with:
+#   source venv/bin/activate
+#   pip install -r requirements.txt
 
 # --- Serial communication (USB ESP32 connection) ---
 pyserial>=3.5
@@ -30,9 +31,13 @@ google-genai>=0.1.0
 # --- Environment variables (.env file support) ---
 python-dotenv>=1.0.0
 
+# --- Bridge control server (FastAPI + Uvicorn) ---
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+
 # --- Coloured terminal output ---
 colorama>=0.4.6
 
 # --- Testing ---
 pytest>=7.0.0
-

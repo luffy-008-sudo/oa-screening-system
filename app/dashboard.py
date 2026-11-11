@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -1049,228 +1050,500 @@ def page_activity_tracking(patient_id: str):
 # ===========================================================================
 
 def page_gait_monitoring(patient_id: str):
-    """Wearable insole foot pressure and kinematic analysis with live meters and past trial playback."""
+    """
+    Wearable insole gait monitoring with REAL-TIME Firebase data.
+
+    Tab 1 — Live Acquisition:
+      - Shows real-time sensor readings from the ESP32 via the bridge API.
+      - Start/stop buttons communicate with serial_firebase_bridge.py.
+      - Live charts update automatically using Streamlit's rerun mechanism.
+
+    Tab 2 — Historical Sessions:
+      - Reads real CSV files saved to data/raw/ by the bridge.
+      - Also reads Firestore session metadata and gait features.
+    """
     render_topbar("Wearable Insole Gait Monitoring", "Sensor Biomechanics & Acquisition", patient_id)
 
-    tab_record, tab_inspect = st.tabs(["⚡ Live Sensor Trial & Acquisition", "📈 Analyze Recorded Gait Sessions"])
+    # Import bridge client (communicates with the separate bridge process)
+    from app.bridge_client import (
+        bridge_is_running,
+        get_bridge_status,
+        get_live_status,
+        start_recording,
+        stop_recording,
+        get_session_history,
+        read_latest_from_rtdb,
+    )
 
-    # -----------------------------------------------------------------------
-    # TAB 1: Live Record / Simulation
-    # -----------------------------------------------------------------------
-    with tab_record:
-        col_ctrl, col_meters = st.columns([1, 1.4])
+    tab_live, tab_history = st.tabs(["⚡ Live Recording", "📈 Session History"])
 
-        with col_ctrl:
-            st.markdown(
-                """
-                <div class="k-card">
-                    <div class="k-card-header">
-                        <h3 class="k-card-title">&#9881; Acquisition Controls</h3>
-                    </div>
-                """,
-                unsafe_allow_html=True,
-            )
+    # =========================================================================
+    # TAB 1: LIVE RECORDING — real ESP32 data, no hardcoded values
+    # =========================================================================
+    with tab_live:
 
-            available_ports = list_serial_ports()
-            mode = st.radio(
-                "Acquisition Mode",
-                ["Demonstration (Simulated Insole)", "Physical Hardware (ESP32 DevKit)"],
-            )
-            is_demo = mode.startswith("Demonstration")
+        # --- Bridge status check ---
+        bridge_online = bridge_is_running()
+        bridge_status = get_live_status() if bridge_online else {}
+        is_recording  = bridge_status.get("bridge_running", False)
+        active_session = bridge_status.get("session_id")
+        active_patient = bridge_status.get("patient_id")
+        valid_samples  = bridge_status.get("valid_samples", 0)
+        demo_active    = bridge_status.get("demo_mode", False)
 
-            selected_port = None
-            if not is_demo:
-                if available_ports:
-                    selected_port = st.selectbox("USB Serial Port", available_ports)
-                else:
-                    st.warning("No USB serial devices detected. Connect ESP32 or use Demo mode.")
+        # --- Top status bar ---
+        col_status, col_start, col_stop = st.columns([2, 1, 1])
 
-            duration = st.slider("Walking Trial Duration (seconds)", min_value=3, max_value=60, value=10)
-            sid = generate_session_id(patient_id)
-
-            st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
-            record_btn = st.button("🔴 Start Walking Session", use_container_width=True)
-
-            st.markdown(
-                """
-                <div style="font-size:0.8rem; color:#888; margin-top:12px; line-height:1.4;">
-                    <strong>Trial Protocol:</strong><br>
-                    1. FSR sensors placed at Heel, Midfoot, and Forefoot.<br>
-                    2. MPU6050 attached to shoe collar.<br>
-                    3. Walk at normal cadence on a flat surface.<br>
-                    4. Software records at ~50 Hz.
-                </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        with col_meters:
-            st.markdown(
-                """
-                <div class="k-card">
-                    <div class="k-card-header">
-                        <h3 class="k-card-title">&#128225; Real-Time Sensor Telemetry (ESP32)</h3>
-                        <span class="k-pill k-pill-orange">50 Hz Target</span>
-                    </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            if record_btn:
-                st.info(f"Acquiring gait data for **{patient_id}** ({duration}s)...")
-                prog = st.progress(0.0)
-                sm = SessionManager(
-                    participant_id=patient_id,
-                    session_id=sid,
-                    port=selected_port,
-                    demo=is_demo,
-                    duration_seconds=duration,
-                    display_readings=False,
-                )
-                res = sm.run(duration_seconds=duration)
-                prog.progress(1.0)
-
-                if res.is_successful:
-                    st.success(f"Walking trial recorded: **{res.rows_written}** samples saved!")
-                    proc = DataProcessor()
-                    clean_path, rep = proc.process_and_save(res.csv_path)
-                    ext = FeatureExtractor()
-                    feat_path, feats = ext.process_and_save(clean_path)
-                    st.success(f"Cleaned & extracted gait features: `{clean_path.name}` ({rep.estimated_sampling_hz:.1f} Hz).")
-                else:
-                    st.error(f"Recording failed: {res.error_message}")
-            else:
-                # Visual live sensor meters
+        with col_status:
+            if not bridge_online:
                 st.markdown(
                     """
-                    <div class="k-sensor-box">
-                        <div class="k-sensor-header"><span>HEEL PRESSURE (FSR 1 • GPIO 34)</span><span class="k-sensor-val">2,140 / 4,095</span></div>
-                        <div class="k-sensor-track"><div class="k-sensor-fill" style="width: 52%;"></div></div>
+                    <div style="background:#1a1a1a;border:1px solid #ef4444;border-radius:8px;padding:12px 16px;">
+                      <span style="color:#ef4444;font-size:1rem;font-weight:600;">&#9679; Bridge Offline</span>
+                      <div style="color:#888;font-size:0.8rem;margin-top:4px;">
+                        Start the bridge server in your terminal first:<br>
+                        <code style="color:#FF6B00;">cd OA_Screening_System &amp;&amp; source venv/bin/activate</code><br>
+                        <code style="color:#FF6B00;">python serial_firebase_bridge.py --server</code>
+                      </div>
                     </div>
-                    <div class="k-sensor-box">
-                        <div class="k-sensor-header"><span>MIDFOOT PRESSURE (FSR 2 • GPIO 35)</span><span class="k-sensor-val">1,480 / 4,095</span></div>
-                        <div class="k-sensor-track"><div class="k-sensor-fill" style="width: 36%;"></div></div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            elif is_recording:
+                st.markdown(
+                    f"""
+                    <div style="background:#1a2a1a;border:1px solid #22c55e;border-radius:8px;padding:12px 16px;">
+                      <span style="color:#22c55e;font-size:1rem;font-weight:600;">&#9679; RECORDING</span>
+                      <span style="color:#888;font-size:0.85rem;margin-left:12px;">
+                        Patient: <strong style="color:#FF6B00;">{active_patient}</strong>
+                        &nbsp;|&nbsp; Samples: <strong style="color:#fff;">{valid_samples:,}</strong>
+                        {"&nbsp;|&nbsp;<span style='color:#fbbf24;'>[DEMO DATA]</span>" if demo_active else ""}
+                      </span>
+                      <div style="color:#555;font-size:0.75rem;margin-top:4px;">Session: {active_session}</div>
                     </div>
-                    <div class="k-sensor-box">
-                        <div class="k-sensor-header"><span>FOREFOOT PRESSURE (FSR 3 • GPIO 32)</span><span class="k-sensor-val">3,250 / 4,095</span></div>
-                        <div class="k-sensor-track"><div class="k-sensor-fill" style="width: 79%;"></div></div>
-                    </div>
-                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:12px;">
-                        <div style="background:#141414; padding:10px; border-radius:8px; border:1px solid #282828;">
-                            <div style="color:#888; font-size:0.75rem;">ACCELEROMETER (MPU6050)</div>
-                            <strong style="color:#FFF; font-size:0.9rem;">X: 0.12g | Y: 0.25g | Z: 0.98g</strong>
-                        </div>
-                        <div style="background:#141414; padding:10px; border-radius:8px; border:1px solid #282828;">
-                            <div style="color:#888; font-size:0.75rem;">GYROSCOPE (MPU6050)</div>
-                            <strong style="color:#FFF; font-size:0.9rem;">Roll: 0.3°/s | Pitch: 0.1°/s | Yaw: 0.4°/s</strong>
-                        </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    """
+                    <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:12px 16px;">
+                      <span style="color:#888;font-size:1rem;font-weight:600;">&#9679; Idle — Ready to Record</span>
+                      <div style="color:#555;font-size:0.8rem;margin-top:4px;">Bridge is online. Configure settings and press Start.</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
 
-            st.markdown("</div>", unsafe_allow_html=True)
+        # --- Controls: only show when bridge is online and not recording ---
+        with col_start:
+            if bridge_online and not is_recording:
+                if st.button("🔴 Start Recording", use_container_width=True, type="primary"):
+                    result = start_recording(
+                        patient_id=patient_id,
+                        serial_port=st.session_state.get("selected_port", ""),
+                        baud_rate=115200,
+                        demo_mode=st.session_state.get("bridge_demo_mode", False),
+                    )
+                    if result.get("success"):
+                        st.success("Recording started!")
+                        st.rerun()
+                    else:
+                        st.error(result.get("message", "Failed to start"))
 
-    # -----------------------------------------------------------------------
-    # TAB 2: Inspect Past Walking Trials
-    # -----------------------------------------------------------------------
-    with tab_inspect:
+        with col_stop:
+            if is_recording:
+                if st.button("⏹ Stop Recording", use_container_width=True):
+                    result = stop_recording()
+                    st.info("Stop signal sent — features will be extracted.")
+                    time.sleep(1.5)
+                    st.rerun()
+
+        st.markdown("---")
+
+        # --- Configuration (only shown when not recording) ---
+        if bridge_online and not is_recording:
+            with st.expander("⚙️ Recording Configuration", expanded=True):
+                cfg_col1, cfg_col2 = st.columns(2)
+                with cfg_col1:
+                    available_ports = list_serial_ports()
+                    use_demo = st.checkbox(
+                        "Demo Mode (no hardware)",
+                        value=not bool(available_ports),
+                        help="Use simulated data if ESP32 is not connected.",
+                    )
+                    st.session_state["bridge_demo_mode"] = use_demo
+
+                    if not use_demo:
+                        if available_ports:
+                            port = st.selectbox("USB Serial Port", available_ports)
+                            st.session_state["selected_port"] = port
+                        else:
+                            st.warning("No serial ports found. Enable Demo Mode or connect ESP32.")
+                            st.session_state["selected_port"] = ""
+                    else:
+                        st.session_state["selected_port"] = ""
+
+                with cfg_col2:
+                    st.markdown(
+                        f"""
+                        <div style="background:#1a1a1a;border-radius:8px;padding:12px;border:1px solid #333;">
+                          <div style="color:#A3A3A3;font-size:0.8rem;margin-bottom:8px;">HARDWARE CONFIGURATION</div>
+                          <div style="color:#ccc;font-size:0.85rem;line-height:1.8;">
+                            Patient: <strong style="color:#FF6B00;">{patient_id}</strong><br>
+                            Baud Rate: <strong style="color:#fff;">115200</strong><br>
+                            Target Rate: <strong style="color:#fff;">50 Hz</strong><br>
+                            Sensors: <strong style="color:#fff;">3x FSR + MPU6050</strong>
+                          </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+        # --- Live sensor display (when recording) ---
+        if is_recording and active_session:
+            st.markdown("### Live Sensor Readings")
+
+            # Read the most recent sample from Firebase RTDB via the bridge API
+            latest = read_latest_from_rtdb(active_patient or patient_id, active_session)
+
+            if latest and "error" not in latest:
+                heel     = int(latest.get("heel",      0))
+                midfoot  = int(latest.get("midfoot",   0))
+                forefoot = int(latest.get("forefoot",  0))
+                ax       = float(latest.get("acc_x_g", 0.0))
+                ay       = float(latest.get("acc_y_g", 0.0))
+                az       = float(latest.get("acc_z_g", 0.0))
+                gx       = float(latest.get("gyro_x_dps", 0.0))
+                gy       = float(latest.get("gyro_y_dps", 0.0))
+                gz       = float(latest.get("gyro_z_dps", 0.0))
+                ts_ms    = int(latest.get("timestamp_ms", 0))
+
+                # FSR pressure bars
+                for label, val, gpio in [
+                    ("HEEL PRESSURE (FSR 1 — GPIO 34)",     heel,     34),
+                    ("MIDFOOT PRESSURE (FSR 2 — GPIO 35)",  midfoot,  35),
+                    ("FOREFOOT PRESSURE (FSR 3 — GPIO 32)", forefoot, 32),
+                ]:
+                    pct = round(val / 4095 * 100, 1)
+                    st.markdown(
+                        f"""
+                        <div class="k-sensor-box">
+                          <div class="k-sensor-header">
+                            <span>{label}</span>
+                            <span class="k-sensor-val">{val:,} / 4,095</span>
+                          </div>
+                          <div class="k-sensor-track">
+                            <div class="k-sensor-fill" style="width:{pct}%;"></div>
+                          </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                # IMU readings
+                imu_col1, imu_col2 = st.columns(2)
+                with imu_col1:
+                    st.markdown(
+                        f"""
+                        <div style="background:#141414;padding:12px;border-radius:8px;border:1px solid #282828;">
+                          <div style="color:#888;font-size:0.75rem;text-transform:uppercase;margin-bottom:6px;">
+                            Accelerometer (MPU6050) — g-force
+                          </div>
+                          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+                            <div><div style="color:#555;font-size:0.7rem;">X-axis</div>
+                              <div style="color:#FF6B00;font-size:1.1rem;font-weight:700;">{ax:+.3f}g</div></div>
+                            <div><div style="color:#555;font-size:0.7rem;">Y-axis</div>
+                              <div style="color:#FF8A24;font-size:1.1rem;font-weight:700;">{ay:+.3f}g</div></div>
+                            <div><div style="color:#555;font-size:0.7rem;">Z-axis</div>
+                              <div style="color:#fff;font-size:1.1rem;font-weight:700;">{az:+.3f}g</div></div>
+                          </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                with imu_col2:
+                    st.markdown(
+                        f"""
+                        <div style="background:#141414;padding:12px;border-radius:8px;border:1px solid #282828;">
+                          <div style="color:#888;font-size:0.75rem;text-transform:uppercase;margin-bottom:6px;">
+                            Gyroscope (MPU6050) — degrees/second
+                          </div>
+                          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+                            <div><div style="color:#555;font-size:0.7rem;">Roll</div>
+                              <div style="color:#FF6B00;font-size:1.1rem;font-weight:700;">{gx:+.2f}</div></div>
+                            <div><div style="color:#555;font-size:0.7rem;">Pitch</div>
+                              <div style="color:#FF8A24;font-size:1.1rem;font-weight:700;">{gy:+.2f}</div></div>
+                            <div><div style="color:#555;font-size:0.7rem;">Yaw</div>
+                              <div style="color:#fff;font-size:1.1rem;font-weight:700;">{gz:+.2f}</div></div>
+                          </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                # Live rolling chart from CSV being written right now
+                csv_path = PROJECT_ROOT / "data" / "raw" / f"{active_session}.csv"
+                if csv_path.exists():
+                    try:
+                        df_live = pd.read_csv(csv_path)
+                        if not df_live.empty and "heel" in df_live.columns:
+                            tail = df_live.tail(200)
+                            if _MATPLOTLIB_AVAILABLE:
+                                fig, axes = create_dark_figure(figsize=(10, 5), nrows=2)
+                                ax_fsr, ax_imu = axes if hasattr(axes, "__len__") else (axes, axes)
+
+                                t = tail["timestamp_ms"] / 1000.0 if "timestamp_ms" in tail.columns else range(len(tail))
+                                ax_fsr.plot(t, tail["heel"],     color="#FF6B00", label="Heel",     linewidth=1.5)
+                                ax_fsr.plot(t, tail["midfoot"],  color="#FF8A24", label="Midfoot",  linewidth=1.4, linestyle="--")
+                                ax_fsr.plot(t, tail["forefoot"], color="#ffffff", label="Forefoot", linewidth=1.4)
+                                ax_fsr.set_ylabel("FSR ADC (0–4095)", color="#9E9E9E", fontsize=8)
+                                ax_fsr.set_ylim(0, 4095)
+                                ax_fsr.legend(facecolor="#1a1a1a", edgecolor="#333", labelcolor="#fff", fontsize=7, loc="upper right")
+                                ax_fsr.set_title(f"Last {len(tail)} samples — Live", color="#fff", fontsize=9)
+
+                                if "acc_z_g" in tail.columns:
+                                    ax_imu.plot(t, tail["acc_x_g"],    color="#FF6B00", label="Acc X", linewidth=1.2)
+                                    ax_imu.plot(t, tail["acc_y_g"],    color="#FF8A24", label="Acc Y", linewidth=1.2)
+                                    ax_imu.plot(t, tail["acc_z_g"],    color="#ffffff", label="Acc Z", linewidth=1.2)
+                                    ax_imu.set_ylabel("Accel (g)", color="#9E9E9E", fontsize=8)
+                                    ax_imu.set_xlabel("Time (s)", color="#9E9E9E", fontsize=8)
+                                    ax_imu.legend(facecolor="#1a1a1a", edgecolor="#333", labelcolor="#fff", fontsize=7, loc="upper right")
+
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                                plt.close(fig)
+                            else:
+                                st.line_chart(tail[["heel", "midfoot", "forefoot"]].values)
+                    except Exception as ex:
+                        st.caption(f"Chart loading… ({ex})")
+
+                # Auto-refresh every 2 seconds while recording
+                st.caption(
+                    f"&#9203; Auto-refreshing every 2s | Last sample: {ts_ms} ms | "
+                    f"Total valid: {valid_samples:,}"
+                )
+                time.sleep(2)
+                st.rerun()
+
+            else:
+                # Recording is started but no data yet
+                st.info("⏳ Waiting for first sensor reading from ESP32…")
+                time.sleep(1.5)
+                st.rerun()
+
+        elif not is_recording and not bridge_online:
+            # Bridge is offline — show how to start it
+            st.markdown(
+                """
+                <div style="background:#1a1a1a;border-radius:10px;padding:20px;border:1px solid #333;margin-top:16px;">
+                  <h4 style="color:#FF6B00;margin:0 0 12px 0;">How to start the bridge</h4>
+                  <p style="color:#888;font-size:0.9rem;margin:0 0 12px 0;">
+                    The bridge is a separate Python process that manages the serial connection.
+                    Open a new terminal window and run:
+                  </p>
+                  <div style="background:#0d0d0d;border-radius:6px;padding:12px;font-family:monospace;color:#22c55e;font-size:0.85rem;line-height:2;">
+                    cd "/Users/sdharshan/PAYGATEWAY AI/oa screening system/OA_Screening_System"<br>
+                    source venv/bin/activate<br>
+                    python serial_firebase_bridge.py --server
+                  </div>
+                  <p style="color:#555;font-size:0.8rem;margin:12px 0 0 0;">
+                    Keep that terminal open while recording. Come back here and click Start.
+                  </p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            # Idle — show placeholder
+            st.markdown(
+                """
+                <div style="background:#141414;border-radius:8px;padding:30px;text-align:center;border:1px solid #222;margin-top:16px;">
+                  <div style="color:#333;font-size:3rem;">&#9711;</div>
+                  <div style="color:#555;font-size:0.95rem;margin-top:8px;">No active recording.</div>
+                  <div style="color:#444;font-size:0.8rem;margin-top:4px;">
+                    Configure settings above and press <strong style="color:#FF6B00;">Start Recording</strong>.
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    # =========================================================================
+    # TAB 2: SESSION HISTORY — reads REAL CSV files and Firestore records
+    # =========================================================================
+    with tab_history:
+
+        # Collect all saved CSVs for this patient
         patient_files = sorted(
-            list(config.DATA_RAW_DIR.glob(f"{patient_id}_*.csv"))
-            + list(config.DATA_DEMO_DIR.glob(f"{patient_id}_*.csv")),
+            list(config.DATA_RAW_DIR.glob(f"{patient_id}_*.csv")),
             key=lambda x: x.stat().st_mtime,
             reverse=True,
         )
 
-        if not patient_files:
-            st.info(f"No walking trials saved for {patient_id} yet.")
-            return
+        # Also try to get Firestore session metadata
+        fs_sessions: list = []
+        if bridge_online:
+            fs_sessions = get_session_history(patient_id)
 
-        sel_file = st.selectbox("Select Walking Session File", patient_files, format_func=lambda x: x.name)
-        if not sel_file:
-            return
+        col_hist_left, col_hist_right = st.columns([1, 2])
 
-        df = pd.read_csv(sel_file)
-        time_s = (
-            (df["timestamp_ms"] - df["timestamp_ms"].iloc[0]) / 1000.0
-            if "timestamp_ms" in df.columns
-            else np.arange(len(df))
-        )
+        with col_hist_left:
+            st.markdown("#### Recorded Sessions")
 
-        st.markdown(
-            """
-            <div class="k-card">
-                <div class="k-card-header">
-                    <h3 class="k-card-title">&#128099; Stance Foot Pressure Loading Profiles (ADC Counts)</h3>
-                    <span class="k-pill k-pill-orange">Heel -> Midfoot -> Forefoot</span>
-                </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        if all(c in df.columns for c in ("heel", "midfoot", "forefoot")):
-            if _MATPLOTLIB_AVAILABLE:
-                fig, ax = create_dark_figure(figsize=(9, 3.8))
-                ax.plot(time_s[:400], df["heel"][:400], color="#FF6B00", label="Heel Sensor", linewidth=1.8)
-                ax.plot(time_s[:400], df["midfoot"][:400], color="#FF8A24", label="Midfoot Sensor", linewidth=1.5, linestyle="--")
-                ax.plot(time_s[:400], df["forefoot"][:400], color="#FFFFFF", label="Forefoot Push-Off", linewidth=1.6)
-                ax.set_xlabel("Time (seconds)", color="#9E9E9E", fontsize=9)
-                ax.set_ylabel("Sensor Counts (ADC)", color="#9E9E9E", fontsize=9)
-                ax.legend(facecolor="#202020", edgecolor="#333333", labelcolor="#FFFFFF", fontsize=8)
-                plt.tight_layout()
-                st.pyplot(fig)
-                plt.close(fig)
+            if not patient_files and not fs_sessions:
+                st.info(f"No sessions recorded yet for {patient_id}.\nRecord a walking trial using the Live Recording tab.")
             else:
-                st.line_chart(df[["heel", "midfoot", "forefoot"]].iloc[:400])
+                # Show Firestore sessions if available
+                if fs_sessions:
+                    st.caption(f"{len(fs_sessions)} sessions in Firestore")
+                    for sess in fs_sessions[:10]:
+                        sid_val    = sess.get("session_id", "")
+                        status_val = sess.get("connection_status", "?")
+                        samples    = sess.get("valid_samples", 0)
+                        dur        = sess.get("duration_seconds", 0)
+                        created    = str(sess.get("created_at", ""))[:19].replace("T", " ")
 
-        st.markdown("</div>", unsafe_allow_html=True)
+                        status_color = "#22c55e" if status_val == "completed" else "#fbbf24"
+                        st.markdown(
+                            f"""
+                            <div style="background:#1a1a1a;border-radius:6px;padding:10px 12px;
+                                        margin-bottom:6px;border:1px solid #2a2a2a;cursor:pointer;">
+                              <div style="color:#FF6B00;font-size:0.75rem;font-family:monospace;">
+                                {sid_val[-20:] if len(sid_val) > 20 else sid_val}
+                              </div>
+                              <div style="display:flex;justify-content:space-between;margin-top:4px;">
+                                <span style="color:{status_color};font-size:0.75rem;">&#9679; {status_val}</span>
+                                <span style="color:#666;font-size:0.75rem;">{samples:,} samples</span>
+                                <span style="color:#666;font-size:0.75rem;">{dur:.0f}s</span>
+                              </div>
+                              <div style="color:#444;font-size:0.7rem;margin-top:2px;">{created}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                elif patient_files:
+                    st.caption(f"{len(patient_files)} CSV files found")
+                    for f in patient_files[:10]:
+                        size_kb = f.stat().st_size // 1024
+                        mtime   = datetime.fromtimestamp(f.stat().st_mtime).strftime("%b %d %H:%M")
+                        st.markdown(
+                            f"""
+                            <div style="background:#1a1a1a;border-radius:6px;padding:8px 12px;
+                                        margin-bottom:4px;border:1px solid #2a2a2a;">
+                              <div style="color:#FF6B00;font-size:0.75rem;font-family:monospace;">{f.name}</div>
+                              <div style="color:#666;font-size:0.72rem;">{mtime} &nbsp;|&nbsp; {size_kb} KB</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
 
-        # Feature Summary Table & CSV Export
-        c_feat, c_raw = st.columns([1.2, 1])
-        with c_feat:
-            st.markdown(
-                """
-                <div class="k-card">
-                    <div class="k-card-header">
-                        <h3 class="k-card-title">&#128203; Extracted Biomechanical Features</h3>
-                    </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            clean_name = sel_file.stem + "_clean_features.json"
-            feat_p = config.DATA_PROCESSED_DIR / clean_name
-            if feat_p.exists():
-                with open(feat_p, "r", encoding="utf-8") as f:
-                    feats = json.load(f)
+        with col_hist_right:
+            if not patient_files:
+                st.info("Select a recorded session to inspect its data.")
             else:
-                ext = FeatureExtractor()
-                feats = ext.extract_features(df)
+                sel_file = st.selectbox(
+                    "Open Session CSV",
+                    patient_files,
+                    format_func=lambda x: x.name,
+                )
 
-            f_items = [{"Metric": k, "Value": v} for k, v in feats.items() if isinstance(v, (int, float, str))]
-            st.dataframe(pd.DataFrame(f_items), use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
+                if sel_file:
+                    df = pd.read_csv(sel_file)
+                    n_rows = len(df)
 
-        with c_raw:
-            st.markdown(
-                """
-                <div class="k-card">
-                    <div class="k-card-header">
-                        <h3 class="k-card-title">&#128196; Export Trial Data</h3>
-                    </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            csv_bytes = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "📥 Download Raw Session CSV",
-                data=csv_bytes,
-                file_name=sel_file.name,
-                mime="text/csv",
-                use_container_width=True,
-            )
-            st.dataframe(df.head(25), use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
+                    # --- Session info row ---
+                    mi1, mi2, mi3, mi4 = st.columns(4)
+                    mi1.metric("Total Samples", f"{n_rows:,}")
+                    if "timestamp_ms" in df.columns and n_rows > 1:
+                        dur_s = (df["timestamp_ms"].iloc[-1] - df["timestamp_ms"].iloc[0]) / 1000.0
+                        actual_hz = n_rows / dur_s if dur_s > 0 else 0
+                        mi2.metric("Duration", f"{dur_s:.1f}s")
+                        mi3.metric("Actual Sample Rate", f"{actual_hz:.1f} Hz")
+                    src = df["data_source"].iloc[0] if "data_source" in df.columns else "real"
+                    mi4.metric("Data Source", src.upper())
+
+                    if src == "simulated":
+                        st.warning("DEMO DATA — these are simulated sensor readings, not from real hardware.")
+
+                    # --- Pressure chart ---
+                    if all(c in df.columns for c in ("heel", "midfoot", "forefoot")):
+                        st.markdown("**FSR Pressure Loading Profile (ADC 0–4095)**")
+                        time_s = (df["timestamp_ms"] - df["timestamp_ms"].iloc[0]) / 1000.0 if "timestamp_ms" in df.columns else np.arange(n_rows)
+
+                        if _MATPLOTLIB_AVAILABLE:
+                            fig, ax = create_dark_figure(figsize=(9, 3.2))
+                            ax.plot(time_s, df["heel"],     color="#FF6B00", label="Heel",     linewidth=1.5)
+                            ax.plot(time_s, df["midfoot"],  color="#FF8A24", label="Midfoot",  linewidth=1.4, linestyle="--")
+                            ax.plot(time_s, df["forefoot"], color="#ffffff", label="Forefoot", linewidth=1.4)
+                            ax.set_xlabel("Time (s)",      color="#9E9E9E", fontsize=9)
+                            ax.set_ylabel("ADC (0–4095)",  color="#9E9E9E", fontsize=9)
+                            ax.set_ylim(0, 4095)
+                            ax.legend(facecolor="#1a1a1a", edgecolor="#333", labelcolor="#fff", fontsize=8)
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            plt.close(fig)
+
+                    # --- IMU chart ---
+                    if all(c in df.columns for c in ("acc_x_g", "acc_y_g", "acc_z_g")):
+                        st.markdown("**Accelerometer (g-force)**")
+                        if _MATPLOTLIB_AVAILABLE:
+                            fig2, ax2 = create_dark_figure(figsize=(9, 2.5))
+                            ax2.plot(time_s, df["acc_x_g"], color="#FF6B00", label="X", linewidth=1.2)
+                            ax2.plot(time_s, df["acc_y_g"], color="#FF8A24", label="Y", linewidth=1.2)
+                            ax2.plot(time_s, df["acc_z_g"], color="#ffffff", label="Z", linewidth=1.2)
+                            ax2.set_xlabel("Time (s)", color="#9E9E9E", fontsize=9)
+                            ax2.set_ylabel("g-force",  color="#9E9E9E", fontsize=9)
+                            ax2.legend(facecolor="#1a1a1a", edgecolor="#333", labelcolor="#fff", fontsize=8)
+                            plt.tight_layout()
+                            st.pyplot(fig2)
+                            plt.close(fig2)
+
+                    # --- Extracted features ---
+                    st.markdown("**Extracted Gait Features**")
+                    feat_p = config.DATA_PROCESSED_DIR / (sel_file.stem + "_clean_features.json")
+                    if feat_p.exists():
+                        with open(feat_p, "r", encoding="utf-8") as f_feat:
+                            feats = json.load(f_feat)
+                        # Show only numeric features in a clean table
+                        feat_rows = [
+                            {"Feature": k, "Value": round(v, 4) if isinstance(v, float) else v}
+                            for k, v in feats.items()
+                            if isinstance(v, (int, float)) and k != "disclaimer"
+                        ]
+                        if feat_rows:
+                            st.dataframe(
+                                pd.DataFrame(feat_rows),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                    else:
+                        # Extract on-the-fly if features file missing
+                        try:
+                            ext = FeatureExtractor()
+                            feats = ext.extract_features(df)
+                            feat_rows = [
+                                {"Feature": k, "Value": round(v, 4) if isinstance(v, float) else v}
+                                for k, v in feats.items()
+                                if isinstance(v, (int, float)) and k != "disclaimer"
+                            ]
+                            if feat_rows:
+                                st.dataframe(
+                                    pd.DataFrame(feat_rows),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                        except Exception as ex:
+                            st.caption(f"Feature extraction skipped: {ex}")
+
+                    # --- CSV download ---
+                    st.download_button(
+                        "📥 Download Session CSV",
+                        data=df.to_csv(index=False).encode("utf-8"),
+                        file_name=sel_file.name,
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
 
 
 # ===========================================================================

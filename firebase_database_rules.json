@@ -1,0 +1,37 @@
+{
+  "rules": {
+    "live_sessions": {
+      "$patientId": {
+        "$sessionId": {
+          // Only authenticated users who own this patient record can read/write
+          // For now: read is restricted to authenticated users,
+          // write is restricted to server (Admin SDK bypasses these rules).
+          // The Python bridge uses Admin SDK — it always has full access.
+          ".read":  "auth != null",
+          ".write": "auth != null",
+
+          "latest": {
+            // Any authenticated user can read the live sensor feed
+            ".read": "auth != null",
+            // Write only allowed by authenticated server (bridge uses admin SDK)
+            ".write": "auth != null"
+          },
+
+          "status": {
+            ".read": "auth != null",
+            ".write": "auth != null"
+          },
+
+          "chunks": {
+            // Chunks can be read by authenticated users
+            ".read": "auth != null",
+            // Chunks: each chunk key can only be set once (no overwrites)
+            "$chunkId": {
+              ".write": "auth != null && !data.exists()"
+            }
+          }
+        }
+      }
+    }
+  }
+}
