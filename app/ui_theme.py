@@ -15,8 +15,14 @@ Visual Identity:
 - Alert / warning:         #EF4444
 """
 
-from typing import Optional, Tuple
-import matplotlib.pyplot as plt
+from typing import Optional, Tuple, Any
+
+try:
+    import matplotlib.pyplot as plt
+    _MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    _MATPLOTLIB_AVAILABLE = False
+    plt = None
 
 THEME_CSS = """
 <style>
@@ -495,15 +501,23 @@ def apply_theme():
     st.markdown(THEME_CSS, unsafe_allow_html=True)
 
 
-def create_dark_figure(figsize: Tuple[float, float] = (8, 3.5)):
+def create_dark_figure(figsize: Tuple[float, float] = (8, 3.5), nrows: int = 1, ncols: int = 1):
     """
     Create a Matplotlib figure and axes pre-styled with the dark & orange theme.
+    Returns (fig, axes) or (None, None) if Matplotlib is unavailable.
     """
-    fig, ax = plt.subplots(figsize=figsize, facecolor="#161616")
-    ax.set_facecolor("#1A1A1A")
-    ax.tick_params(colors="#9E9E9E", labelsize=9)
-    for spine in ax.spines.values():
-        spine.set_color("#2E2E2E")
-    ax.grid(True, color="#262626", linestyle="--", linewidth=0.7, alpha=0.8)
-    return fig, ax
+    if not _MATPLOTLIB_AVAILABLE or plt is None:
+        return None, None
+
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize, facecolor="#161616")
+    ax_list = [axes] if not hasattr(axes, "__len__") else (axes.flat if hasattr(axes, "flat") else axes)
+
+    for ax in ax_list:
+        ax.set_facecolor("#1A1A1A")
+        ax.tick_params(colors="#9E9E9E", labelsize=9)
+        for spine in ax.spines.values():
+            spine.set_color("#2E2E2E")
+        ax.grid(True, color="#262626", linestyle="--", linewidth=0.7, alpha=0.8)
+
+    return fig, axes
 
