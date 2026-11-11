@@ -6,7 +6,7 @@
 [![Hardware](https://img.shields.io/badge/Hardware-ESP32%20DevKit%20%2B%20MPU6050-orange.svg)](https://www.espressif.com/)
 [![Firebase](https://img.shields.io/badge/Database-Cloud%20Firestore-yellow.svg)](https://firebase.google.com/)
 [![AI Engine](https://img.shields.io/badge/AI-Gemini%202.5%20Flash-4285F4.svg)](https://ai.google.dev/)
-[![Tests](https://img.shields.io/badge/Tests-156%20Passing-brightgreen.svg)](run_tests.py)
+[![Tests](https://img.shields.io/badge/Tests-156%20%2B%2027%20Passing-brightgreen.svg)](run_tests.py)
 
 ---
 
@@ -44,20 +44,20 @@
          ESP32 DevKit V1
                  │
                  ▼
-         Python Processing Core
-  ├── SerialReceiver (Validates 50 Hz JSON stream, frame loss detection)
-  ├── DataProcessor (Outlier detection, filtering, stance detection)
-  ├── FeatureExtractor (Loading rate, COP shift, angular variability)
-  ├── BaselineEngine (Patient-specific median & MAD baseline profiles)
-  ├── AnomalyDetector (Robust Z-scores, multi-variable pattern detection)
-  └── AIReportGenerator (Gemini 2.5 Flash plain-English patient summaries)
+  Standalone Bridge & FastAPI Control Server (`serial_firebase_bridge.py`)
+  ├── Validates 50 Hz JSON/CSV packets & writes local CSV backups (`data/raw/`)
+  ├── Pushes live telemetry every ~200 ms & 50-sample chunks to Realtime Database
+  ├── Persists session metadata & extracted gait features to Cloud Firestore
+  └── Serves local control & telemetry API at `http://127.0.0.1:8765`
                  │
-        ┌────────┴────────┐
-        ▼                 ▼
-Google Cloud Firestore   Streamlit Dashboard
-(Patients, Sessions,     (Orange & Black Clinical
- Daily Logs, Baselines,   Fitness-Tech UI)
- AI Insights)
+        ┌────────┴────────────────────────┐
+        ▼                                 ▼
+Firebase Cloud                    Python Analytics & Streamlit Dashboard
+├── Realtime Database             ├── `bridge_client.py` (HTTP client to bridge)
+│   (`live_sessions/{pid}/{sid}`) ├── `DataProcessor` & `FeatureExtractor`
+└── Cloud Firestore               ├── `BaselineEngine` & `AnomalyDetector`
+    (`patients/{pid}/gait_sessions`) ├── `AIReportGenerator` (Gemini 2.5 Flash)
+                                  └── 9-Module Orange & Black Dashboard UI
 ```
 
 ---
@@ -100,8 +100,8 @@ The user interface follows a modern fitness-tech and health tracking aesthetic:
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/luffy-008-sudo/OA_Screening_System.git
-cd OA_Screening_System
+git clone https://github.com/luffy-008-sudo/oa-screening-system.git
+cd oa-screening-system
 ```
 
 ### 2. Create and Activate Virtual Environment
@@ -127,13 +127,16 @@ Open `.env` and fill in your details:
 GEMINI_API_KEY=your-gemini-api-key-here
 GEMINI_MODEL_NAME=gemini-2.5-flash
 
-# Firebase Firestore (optional — local mode works without cloud)
+# Firebase Firestore & Realtime Database (optional — local mode works without cloud)
 FIREBASE_CREDENTIALS_PATH=secrets/firebase-key.json
-FIREBASE_PROJECT_ID=your-project-id
+FIREBASE_PROJECT_ID=your-firebase-project-id
+FIREBASE_DATABASE_URL=https://your-firebase-project-id-default-rtdb.asia-southeast1.firebasedatabase.app
 
-# Hardware Serial Port (leave blank to auto-detect or use Demo mode)
+# Hardware Serial Port (leave blank to auto-detect or use the UI)
 SERIAL_PORT=
 SERIAL_BAUD_RATE=115200
+BAUD_RATE=115200
+PATIENT_ID=patient_001
 DEMO_MODE=false
 ```
 
@@ -162,27 +165,36 @@ DEMO_MODE=false
 
 ## 🖥️ Running the Application
 
-Launch the Streamlit web dashboard:
+Run the ESP32-to-Firebase bridge server and the Streamlit dashboard in two separate terminals:
+
+**Terminal 1 — ESP32 $\rightarrow$ Firebase Bridge Server:**
 ```bash
+source venv/bin/activate
+python serial_firebase_bridge.py --server
+```
+*(Or run standalone CLI capture without the UI: `python serial_firebase_bridge.py --patient patient_001`)*
+
+**Terminal 2 — Streamlit Web Dashboard:**
+```bash
+source venv/bin/activate
 streamlit run app/dashboard.py
 ```
 Open your browser at **`http://localhost:8501`**.
 
-> **Note on Demo Mode:** If no physical ESP32 is plugged in, the system seamlessly operates in **Demonstration Mode**, streaming realistic 50 Hz synthetic walking profiles with full feature extraction and Gemini AI insights.
+> **Note on Demo Mode:** If no physical ESP32 is plugged in, enable **Demo Mode (no hardware)** on the Gait Monitoring page or pass `--demo` to `serial_firebase_bridge.py` to test safely without writing simulated data to production Firebase.
 
 ---
 
 ## 🧪 Automated Verification & Tests
 
-Run the master test runner covering all 7 development modules:
+Run the core test suite and the ESP32-Firebase bridge pipeline tests:
 ```bash
 python run_tests.py
+python test_bridge_pipeline.py
 ```
 **Expected Result:**
-```
-Ran 156 tests in 8.4s
-OK (skipped=19 live cloud integration tests)
-```
+- `run_tests.py`: 156 tests passing
+- `test_bridge_pipeline.py`: 27 tests passing
 
 ---
 
@@ -192,16 +204,22 @@ OK (skipped=19 live cloud integration tests)
 OA_Screening_System/
 ├── .env.example                    # Environment template
 ├── .gitignore                      # Security-audited git exclusions
+├── .python-version                 # Python 3.11 pin for cloud deployment
+├── firebase_database_rules.json    # Realtime Database security rules
 ├── requirements.txt                # Python package manifest
+├── serial_firebase_bridge.py       # Standalone ESP32 -> Firebase RTDB & Firestore bridge
+├── test_bridge_pipeline.py         # End-to-end bridge pipeline tests
 ├── run_tests.py                    # Master test runner
 ├── README.md                       # Documentation
 ├── .streamlit/
 │   └── config.toml                 # Streamlit dark theme configuration
 ├── app/
-│   ├── config.py                   # Central configuration
+│   ├── config.py                   # Central configuration (st.secrets + .env)
 │   ├── ui_theme.py                 # Orange & Black CSS & component system
 │   ├── patient_profile_service.py  # Profile & medical records persistence
 │   ├── serial_receiver.py          # ESP32 USB serial acquisition
+│   ├── bridge_client.py            # HTTP client for serial_firebase_bridge.py
+│   ├── firebase_rtdb_listener.js   # Browser Realtime Database live listener
 │   ├── data_logger.py              # CSV recording
 │   ├── data_processor.py           # Signal cleaning & calibration
 │   ├── feature_extractor.py        # Biomechanical feature computation
